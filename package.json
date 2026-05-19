@@ -1,0 +1,14 @@
+{
+  "name": "dkbv-node",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "fetch-cookie": "^3.1.0",
+    "tough-cookie": "^4.1.4"
+  }
+}
