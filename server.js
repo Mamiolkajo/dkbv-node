@@ -2,6 +2,10 @@ import express from "express";
 import makeFetchCookie from "fetch-cookie";
 import { CookieJar } from "tough-cookie";
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 const app = express();
 app.use(express.json());
 
