@@ -3,13 +3,13 @@ import makeFetchCookie from "fetch-cookie";
 import { CookieJar } from "tough-cookie";
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const app = express();
 app.use(express.json());
 
-// CORS så WP/browser kan kalde API’et
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -19,37 +19,39 @@ app.use((req, res, next) => {
 });
 
 const ORIGIN = "https://rkr.statbank.dk";
+const PT_DA_URL = `${ORIGIN}/statbank5a/PTda.asp`;
+const DEFINE_URL =
+  `${ORIGIN}/statbank5a/SelectVarVal/Define.asp?MainTable=BM011&PLanguage=0&PXSId=0&wsid=cflastupd`;
+const SAVE_URL = `${ORIGIN}/statbank5a/SelectVarVal/saveselections.asp`;
+const SHOWTABLE_URL = `${ORIGIN}/statbank5a/SelectVarVal/ShowTable.asp`;
 
-// rkr / statbank5a endpoints
-const PT_DA_URL    = `${ORIGIN}/statbank5a/PTda.asp`;
-const DEFINE_URL   = `${ORIGIN}/statbank5a/SelectVarVal/Define.asp?MainTable=BM011&PLanguage=0&PXSId=0&wsid=cflastupd`;
-const SAVE_URL     = `${ORIGIN}/statbank5a/SelectVarVal/saveselections.asp`;
-const SHOWTABLE_URL= `${ORIGIN}/statbank5a/SelectVarVal/ShowTable.asp`;
-
-// --- simpel cache (30 min) ---
-const CACHE_TTL_MS = 30 * 60 * 1000;
+// Cache (1 time)
+const CACHE_TTL_MS = 60 * 60 * 1000;
 const CACHE = new Map();
 function cacheGet(key) {
   const v = CACHE.get(key);
   if (!v) return null;
-  if (Date.now() - v.t > CACHE_TTL_MS) { CACHE.delete(key); return null; }
+  if (Date.now() - v.t > CACHE_TTL_MS) {
+    CACHE.delete(key);
+    return null;
+  }
   return v.data;
 }
 function cacheSet(key, data) {
   CACHE.set(key, { t: Date.now(), data });
 }
 
-// Headers der ligner browser nok til ASP-sider
-function baseHeaders() {
-  return {
+function baseHeaders(referer) {
+  const h = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Origin": ORIGIN
+    "Origin": ORIGIN,
   };
+  if (referer) h["Referer"] = referer;
+  return h;
 }
 
-// rkr bruger ofte iso-8859-1 => response.text() kan give fejl.
-// Brug arrayBuffer + TextDecoder(iso-8859-1) [1](https://www.saleswise.ai/blog/real-estate-property-valuation-methods)[2](https://www.dst.dk/en/Statistik/emner/oekonomi/ejendomme)
+// rkr bruger ofte iso-8859-1 => brug arrayBuffer + TextDecoder [1](https://oddjar.com/gravity-forms-calculations-pricing-fields-order-forms-guide/)[2](https://vaekster.dk/blog/fa-lavet-en-prisberegnertilbudsberegner-til-wordpress-leadmagnet-der-konverterer/)
 async function readHtml(resp) {
   const buf = await resp.arrayBuffer();
   const decoder = new TextDecoder("iso-8859-1");
@@ -79,15 +81,15 @@ function extractFrameSrc(html) {
 
 async function unwrapFrames(fetchCookie, html, referer) {
   let current = decodeEntities(html);
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     if (!looksLikeFrameset(current)) return current;
     const src = extractFrameSrc(current);
     if (!src) return current;
 
-    const r = await fetchCookie(src, {
-      headers: { ...baseHeaders(), Referer: referer }
-    });
+    await sleep(1200);
+    const r = await fetchCookie(src, { headers: baseHeaders(referer) });
     current = decodeEntities(await readHtml(r));
+    referer = src;
   }
   return current;
 }
@@ -97,9 +99,7 @@ function isDbDown(html) {
   return h.includes("/dbdown/") || h.includes("dbdown") || h.includes("msgid=");
 }
 
-// Find seneste kvartal fra Define.asp
 function findLatestQuarterCode(html) {
-  // accepter både 2025K4 og 2025Q4
   const re = /\b(19|20)\d{2}[KQ][1-4]\b/g;
   const hits = html.match(re) || [];
   const uniq = [...new Set(hits)];
@@ -113,29 +113,35 @@ function quarterToNum(code) {
   return year * 10 + q;
 }
 
-// Byg body til saveselections.asp
-// VIGTIGT: her bruger vi ejkat (var2) specifikt – ikke "*"
 function buildSelectionBody({ postnr, ejkat, pris, tid }) {
   const p = new URLSearchParams();
 
+  // VIGTIGT: normal & (URLSearchParams encoder selv)
   p.set("TS", "ShowTable&OldTab=SELECT&SubjectCode=201&AntVar=4&Contents=Indhold&tidrubr=rubrik4");
+
   p.set("PLanguage", "0");
   p.set("FF", "20");
   p.set("OldTab", "SELECT");
   p.set("SavePXSId", "0");
 
-  p.set("grouping1", ""); p.set("var1", postnr);
-  p.set("grouping2", ""); p.set("var2", ejkat);
-  p.set("grouping3", ""); p.set("var3", pris);
+  p.set("grouping1", "");
+  p.set("var1", postnr);
+
+  p.set("grouping2", "");
+  p.set("var2", ejkat);
+
+  p.set("grouping3", "");
+  p.set("var3", pris);
 
   p.set("rubrik4", "kvartal");
-  p.set("grouping4", ""); p.set("var4", tid);
+  p.set("grouping4", "");
+  p.set("var4", tid);
 
   p.set("valgteceller", "1");
   p.set("Forward.x", "44");
   p.set("Forward.y", "7");
-  p.set("tidrubr", "rubrik4");
 
+  p.set("tidrubr", "rubrik4");
   p.set("MainTable", "BM011");
   p.set("SubTable", "S0");
   p.set("SelCont", "Indhold");
@@ -148,124 +154,121 @@ function buildSelectionBody({ postnr, ejkat, pris, tid }) {
   p.set("GuestFileSize", "20000");
   p.set("MaxFileSize", "20000");
 
-  p.set("V1", "PNR20");   p.set("VS1", "VM20PNR11");     p.set("VP1", "postnumre");
-  p.set("V2", "EJKAT20"); p.set("VS2", "VM20EJKAT011");  p.set("VP2", "ejendomskategori");
-  p.set("V3", "PRIS20");  p.set("VS3", "VM20PRIS011");   p.set("VP3", "priser på realiserede handler");
-  p.set("V4", "Tid");     p.set("VS4", "");              p.set("VP4", "");
+  p.set("V1", "PNR20");
+  p.set("VS1", "VM20PNR11");
+  p.set("VP1", "postnumre");
 
+  p.set("V2", "EJKAT20");
+  p.set("VS2", "VM20EJKAT011");
+  p.set("VP2", "ejendomskategori");
+
+  p.set("V3", "PRIS20");
+  p.set("VS3", "VM20PRIS011");
+  p.set("VP3", "priser på realiserede handler");
+
+  p.set("V4", "Tid");
+  p.set("VS4", "");
+  p.set("VP4", "");
   p.set("boksnr", "");
   p.set("tfrequency", "4");
 
   return p.toString();
 }
 
-// Parse den rigtige INDHOLD-celle fra HTML-tabel
-// Når vi kun har 1 postnr + 1 ejkat + 1 pris + 1 tid, er der typisk kun 1 talcelle.
+// Find "INDHOLD" tal i table (når der kun er 1 celle)
 function extractIndholdFromHtml(html) {
-  // find alle tabeller
   const tables = html.match(/<table[\s\S]*?<\/table>/gi) || [];
-  if (!tables.length) return null;
-
   for (const table of tables) {
     const lower = table.toLowerCase();
-    // Kun tabeller med "indhold" er interessante
     if (!lower.includes("indhold")) continue;
 
-    // find alle <td>..</td> i tabellen
     const tds = [...table.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
-      .map(m => m[1])
-      .map(s => String(s).replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").trim());
+      .map((m) => m[1])
+      .map((s) => String(s).replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").trim());
 
-    // konverter tal som 45.123 / 45123 / 45,123
     const nums = tds
-      .map(s => s.replace(/\./g, "").replace(",", "."))
-      .filter(s => /^\d+(\.\d+)?$/.test(s))
+      .map((s) => s.replace(/\./g, "").replace(",", "."))
+      .filter((s) => /^\d+(\.\d+)?$/.test(s))
       .map(Number)
-      .filter(n => Number.isFinite(n))
-      // realistisk m²-pris
-      .filter(n => n >= 2000 && n <= 250000);
+      .filter((n) => Number.isFinite(n))
+      .filter((n) => n >= 2000 && n <= 250000);
 
-    // hvis vi har præcis 1 -> returnér den
     if (nums.length === 1) return nums[0];
-
-    // ellers returnér den mest plausible (største – men efter filtrering)
-    if (nums.length > 1) {
-      nums.sort((a,b)=>b-a);
-      return nums[0];
-    }
+    if (nums.length > 1) return nums.sort((a, b) => b - a)[0];
   }
-
   return null;
 }
 
-// Health check
+// Retry wrapper (mod DBDown)
+async function withDbDownRetry(fn) {
+  for (let i = 0; i < 3; i++) {
+    const html = await fn();
+    if (!isDbDown(html)) return html;
+    await sleep(5000);
+  }
+  return null;
+}
+
 app.get("/", (req, res) => res.json({ ok: true, service: "dkbv-node" }));
 
-// API endpoint
 app.post("/bm011", async (req, res) => {
   try {
     const postnr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const ejkat  = String(req.body?.ejkat || "2");      // 1/2/3
-    const pris   = String(req.body?.pris || "REAL");    // din cURL brugte REAL
-    let tid      = String(req.body?.tid || "latest");
-    const debug  = req.body?.debug === true;
+    const ejkat = String(req.body?.ejkat || "2"); // 1/2/3
+    const pris = String(req.body?.pris || "REAL");
+    let tid = String(req.body?.tid || "latest");
+    const debug = req.body?.debug === true;
 
-    if (postnr.length !== 4) {
-      return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
-    }
+    if (postnr.length !== 4) return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
 
     const cacheKey = `${postnr}|${ejkat}|${pris}|${tid}`;
     const cached = cacheGet(cacheKey);
     if (cached && !debug) return res.json({ ok: true, ...cached, cached: true });
 
-    // cookie jar pr request (stabilt) [4](https://github.com/agenticpress/ai-home-value-estimator)[3](https://www.one.com/en-us/hosting/file-manager/)
+    // Cookie jar pr request (ASP session cookies) [3](https://w3schoolofcoding.com/php-parse-syntax-errors-and-how-to-solve-them/)[4](https://www.statistikbanken.dk/statbank5a/selectvarval/define.asp?MainTable=EJ67)
     const jar = new CookieJar();
     const fetchCookie = makeFetchCookie(fetch, jar);
 
-    // 1) Sæt dansk sprog (PTda)
+    // 1) Dansk sprog
     await fetchCookie(PT_DA_URL, { headers: baseHeaders() });
+    await sleep(1200);
 
-    // 2) Hent Define (for latest quarter)
+    // 2) Define => latest kvartal
     const defineResp = await fetchCookie(DEFINE_URL, { headers: baseHeaders() });
     const defineHtml = decodeEntities(await readHtml(defineResp));
 
     if (!tid || tid === "latest" || tid === "seneste") {
       const latest = findLatestQuarterCode(defineHtml);
-      if (!latest) {
-        return res.status(502).json({ ok: false, error: "Kunne ikke finde seneste kvartal" });
-      }
+      if (!latest) return res.status(502).json({ ok: false, error: "Kunne ikke finde seneste kvartal" });
       tid = latest;
     }
 
-    // 3) POST selections (nu med ejkat specifikt!)
+    // 3) Save selections
     const body = buildSelectionBody({ postnr, ejkat, pris, tid });
 
+    await sleep(1200);
     const saveResp = await fetchCookie(SAVE_URL, {
       method: "POST",
-      headers: {
-        ...baseHeaders(),
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": DEFINE_URL
-      },
+      headers: { ...baseHeaders(DEFINE_URL), "Content-Type": "application/x-www-form-urlencoded" },
       body
     });
 
-    let html = decodeEntities(await readHtml(saveResp));
-    html = await unwrapFrames(fetchCookie, html, SAVE_URL);
+    let saveHtml = decodeEntities(await readHtml(saveResp));
+    saveHtml = await unwrapFrames(fetchCookie, saveHtml, SAVE_URL);
 
-    // 4) Hent ShowTable (oftest der hvor tabellen er)
-    const showResp = await fetchCookie(SHOWTABLE_URL, {
-      headers: { ...baseHeaders(), Referer: SAVE_URL }
+    // 4) ShowTable (med retry mod DBDown)
+    const showHtml = await withDbDownRetry(async () => {
+      await sleep(1200);
+      const showResp = await fetchCookie(SHOWTABLE_URL, { headers: baseHeaders(SAVE_URL) });
+      let h = decodeEntities(await readHtml(showResp));
+      h = await unwrapFrames(fetchCookie, h, SHOWTABLE_URL);
+      return h;
     });
 
-    let showHtml = decodeEntities(await readHtml(showResp));
-    showHtml = await unwrapFrames(fetchCookie, showHtml, SHOWTABLE_URL);
-
-    if (isDbDown(showHtml)) {
+    if (!showHtml) {
       return res.status(503).json({
         ok: false,
-        error: "rkr svarer med DBDown (midlertidigt utilgængelig/blokeret). Prøv igen senere.",
-        debug: { htmlSnippet: showHtml.slice(0, 1200) }
+        error: "rkr svarer med DBDown (midlertidigt utilgængelig/blokeret). Prøv igen senere."
       });
     }
 
@@ -297,5 +300,3 @@ app.post("/bm011", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Listening on", PORT));
