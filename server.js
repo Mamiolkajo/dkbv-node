@@ -1,15 +1,9 @@
 import express from "express";
-import makeFetchCookie from "fetch-cookie";
-import { CookieJar } from "tough-cookie";
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 const app = express();
 app.use(express.json());
 
-// CORS
+// CORS så WordPress/browser kan kalde API’et
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -18,285 +12,180 @@ app.use((req, res, next) => {
   next();
 });
 
-const ORIGIN = "https://rkr.statbank.dk";
-const PT_DA_URL = `${ORIGIN}/statbank5a/PTda.asp`;
-const DEFINE_URL =
-  `${ORIGIN}/statbank5a/SelectVarVal/Define.asp?MainTable=BM011&PLanguage=0&PXSId=0&wsid=cflastupd`;
-const SAVE_URL = `${ORIGIN}/statbank5a/SelectVarVal/saveselections.asp`;
-const SHOWTABLE_URL = `${ORIGIN}/statbank5a/SelectVarVal/ShowTable.asp`;
+// ====== StatBank API (officiel) ======
+const SB_API = "https://api.statbank.dk/v1"; // endpoints: /tableinfo, /data [1](https://wpforms.com/docs/calculations-formula-examples/)
+const TABLE = "BM011";
+const LANG = "da";
 
-// Cache (1 time)
-const CACHE_TTL_MS = 60 * 60 * 1000;
-const CACHE = new Map();
+// ====== Cache (production) ======
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 timer
+const CACHE = new Map(); // key -> {t, data}
 function cacheGet(key) {
   const v = CACHE.get(key);
   if (!v) return null;
-  if (Date.now() - v.t > CACHE_TTL_MS) {
-    CACHE.delete(key);
-    return null;
-  }
-  return v.data;
+  const age = Date.now() - v.t;
+  return { ...v.data, _ageMs: age, _fresh: age <= CACHE_TTL_MS };
 }
 function cacheSet(key, data) {
   CACHE.set(key, { t: Date.now(), data });
 }
 
-function baseHeaders(referer) {
-  const h = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Origin": ORIGIN,
+// ====== Simpel rate limit (per IP) ======
+const RL = new Map(); // ip -> {t, n}
+const RL_WINDOW_MS = 10_000; // 10 sek
+const RL_MAX = 5; // max 5 requests pr 10 sek pr ip
+function rateLimit(req, res) {
+  const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const cur = RL.get(ip) || { t: now, n: 0 };
+  if (now - cur.t > RL_WINDOW_MS) { cur.t = now; cur.n = 0; }
+  cur.n += 1;
+  RL.set(ip, cur);
+  if (cur.n > RL_MAX) {
+    res.status(429).json({ ok: false, error: "Rate limit: prøv igen om lidt." });
+    return false;
+  }
+  return true;
+}
+
+function jsonPost(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(async (res) => {
+    const txt = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${txt.slice(0, 200)}`);
+    return txt;
+  });
+}
+
+async function getTableInfo() {
+  const body = { lang: LANG, table: TABLE, format: "JSON" };
+  const txt = await jsonPost(`${SB_API}/tableinfo`, body); // [1](https://wpforms.com/docs/calculations-formula-examples/)
+  return JSON.parse(txt);
+}
+
+function findLatestTid(tableInfo) {
+  const vars = tableInfo.variables || [];
+  const tidVar = vars.find(v => v.id === "Tid");
+  if (!tidVar || !tidVar.values) return null;
+  const ids = tidVar.values.map(x => x.id).filter(Boolean).sort();
+  return ids.length ? ids[ids.length - 1] : null;
+}
+
+function findPris20Realiseret(tableInfo) {
+  const vars = tableInfo.variables || [];
+  const prisVar = vars.find(v => v.id === "PRIS20");
+  if (!prisVar || !prisVar.values) return null;
+
+  // vælg den value der indeholder “realiseret/realized”
+  for (const val of prisVar.values) {
+    const t = (val.text || "").toLowerCase();
+    if (t.includes("realiseret") || t.includes("realized")) return val.id;
+  }
+  // fallback: første hvis teksten ændrer sig
+  return prisVar.values[0]?.id || null;
+}
+
+function parseBulkSemicolon(txt) {
+  const lines = txt.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const header = lines[0].split(";");
+  const idxV = header.indexOf("INDHOLD");
+  if (idxV === -1) return null;
+
+  // 1 række forventes når vi sender 1 postnr + 1 ejkat + 1 pris + 1 tid
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(";");
+    const val = Number(String(cols[idxV] || "").replace(",", "."));
+    if (Number.isFinite(val) && val > 0) return val;
+  }
+  return null;
+}
+
+async function fetchM2FromStatbank(postnr, ejkat, tid = "latest") {
+  const ti = await getTableInfo();
+  const latestTid = (tid === "latest" || tid === "seneste") ? findLatestTid(ti) : tid;
+  const pris20 = findPris20Realiseret(ti);
+
+  if (!latestTid) throw new Error("Kunne ikke finde seneste Tid i tableinfo.");
+  if (!pris20) throw new Error("Kunne ikke finde PRIS20 (realiseret) i tableinfo.");
+
+  const req = {
+    table: TABLE,
+    lang: LANG,
+    format: "BULK",
+    variables: [
+      { code: "PNR20", values: [postnr] },
+      { code: "EJKAT20", values: [ejkat] },
+      { code: "PRIS20", values: [pris20] },
+      { code: "Tid", values: [latestTid] }
+    ]
   };
-  if (referer) h["Referer"] = referer;
-  return h;
+
+  const bulk = await jsonPost(`${SB_API}/data`, req); // [1](https://wpforms.com/docs/calculations-formula-examples/)
+  const m2 = parseBulkSemicolon(bulk);
+
+  if (!m2) throw new Error("Kunne ikke parse INDHOLD fra BULK.");
+  return { m2_price: m2, kvartal: latestTid, source: "api.statbank.dk" };
 }
 
-// rkr bruger ofte iso-8859-1 => brug arrayBuffer + TextDecoder [1](https://oddjar.com/gravity-forms-calculations-pricing-fields-order-forms-guide/)[2](https://vaekster.dk/blog/fa-lavet-en-prisberegnertilbudsberegner-til-wordpress-leadmagnet-der-konverterer/)
-async function readHtml(resp) {
-  const buf = await resp.arrayBuffer();
-  const decoder = new TextDecoder("iso-8859-1");
-  return decoder.decode(buf);
-}
+// Health
+app.get("/", (req, res) => res.json({ ok: true, service: "dkbv-node", source: "api.statbank.dk" }));
 
-function decodeEntities(s) {
-  return String(s || "")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ");
-}
-
-function looksLikeFrameset(html) {
-  const h = html.toLowerCase();
-  return h.includes("<frameset") && h.includes("<frame");
-}
-
-function extractFrameSrc(html) {
-  const m = html.match(/<frame[^>]+src="([^"]+)"/i);
-  if (!m) return null;
-  return m[1].startsWith("/") ? ORIGIN + m[1] : m[1];
-}
-
-async function unwrapFrames(fetchCookie, html, referer) {
-  let current = decodeEntities(html);
-  for (let i = 0; i < 6; i++) {
-    if (!looksLikeFrameset(current)) return current;
-    const src = extractFrameSrc(current);
-    if (!src) return current;
-
-    await sleep(1200);
-    const r = await fetchCookie(src, { headers: baseHeaders(referer) });
-    current = decodeEntities(await readHtml(r));
-    referer = src;
-  }
-  return current;
-}
-
-function isDbDown(html) {
-  const h = html.toLowerCase();
-  return h.includes("/dbdown/") || h.includes("dbdown") || h.includes("msgid=");
-}
-
-function findLatestQuarterCode(html) {
-  const re = /\b(19|20)\d{2}[KQ][1-4]\b/g;
-  const hits = html.match(re) || [];
-  const uniq = [...new Set(hits)];
-  if (!uniq.length) return null;
-  uniq.sort((a, b) => quarterToNum(b) - quarterToNum(a));
-  return uniq[0];
-}
-function quarterToNum(code) {
-  const year = Number(code.slice(0, 4));
-  const q = Number(code.slice(5, 6));
-  return year * 10 + q;
-}
-
-function buildSelectionBody({ postnr, ejkat, pris, tid }) {
-  const p = new URLSearchParams();
-
-  // VIGTIGT: normal & (URLSearchParams encoder selv)
-  p.set("TS", "ShowTable&OldTab=SELECT&SubjectCode=201&AntVar=4&Contents=Indhold&tidrubr=rubrik4");
-
-  p.set("PLanguage", "0");
-  p.set("FF", "20");
-  p.set("OldTab", "SELECT");
-  p.set("SavePXSId", "0");
-
-  p.set("grouping1", "");
-  p.set("var1", postnr);
-
-  p.set("grouping2", "");
-  p.set("var2", ejkat);
-
-  p.set("grouping3", "");
-  p.set("var3", pris);
-
-  p.set("rubrik4", "kvartal");
-  p.set("grouping4", "");
-  p.set("var4", tid);
-
-  p.set("valgteceller", "1");
-  p.set("Forward.x", "44");
-  p.set("Forward.y", "7");
-
-  p.set("tidrubr", "rubrik4");
-  p.set("MainTable", "BM011");
-  p.set("SubTable", "S0");
-  p.set("SelCont", "Indhold");
-  p.set("Contents", "Indhold");
-  p.set("SubjectCode", "201");
-  p.set("SubjectArea", "Boligmarkedsstatistikken");
-  p.set("antvar", "4");
-  p.set("action", "urval");
-  p.set("guest", "-1");
-  p.set("GuestFileSize", "20000");
-  p.set("MaxFileSize", "20000");
-
-  p.set("V1", "PNR20");
-  p.set("VS1", "VM20PNR11");
-  p.set("VP1", "postnumre");
-
-  p.set("V2", "EJKAT20");
-  p.set("VS2", "VM20EJKAT011");
-  p.set("VP2", "ejendomskategori");
-
-  p.set("V3", "PRIS20");
-  p.set("VS3", "VM20PRIS011");
-  p.set("VP3", "priser på realiserede handler");
-
-  p.set("V4", "Tid");
-  p.set("VS4", "");
-  p.set("VP4", "");
-  p.set("boksnr", "");
-  p.set("tfrequency", "4");
-
-  return p.toString();
-}
-
-// Find "INDHOLD" tal i table (når der kun er 1 celle)
-function extractIndholdFromHtml(html) {
-  const tables = html.match(/<table[\s\S]*?<\/table>/gi) || [];
-  for (const table of tables) {
-    const lower = table.toLowerCase();
-    if (!lower.includes("indhold")) continue;
-
-    const tds = [...table.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
-      .map((m) => m[1])
-      .map((s) => String(s).replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").trim());
-
-    const nums = tds
-      .map((s) => s.replace(/\./g, "").replace(",", "."))
-      .filter((s) => /^\d+(\.\d+)?$/.test(s))
-      .map(Number)
-      .filter((n) => Number.isFinite(n))
-      .filter((n) => n >= 2000 && n <= 250000);
-
-    if (nums.length === 1) return nums[0];
-    if (nums.length > 1) return nums.sort((a, b) => b - a)[0];
-  }
-  return null;
-}
-
-// Retry wrapper (mod DBDown)
-async function withDbDownRetry(fn) {
-  for (let i = 0; i < 3; i++) {
-    const html = await fn();
-    if (!isDbDown(html)) return html;
-    await sleep(5000);
-  }
-  return null;
-}
-
-app.get("/", (req, res) => res.json({ ok: true, service: "dkbv-node" }));
-
+// Main endpoint
 app.post("/bm011", async (req, res) => {
+  if (!rateLimit(req, res)) return;
+
   try {
     const postnr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const ejkat = String(req.body?.ejkat || "2"); // 1/2/3
-    const pris = String(req.body?.pris || "REAL");
-    let tid = String(req.body?.tid || "latest");
-    const debug = req.body?.debug === true;
+    const ejkat  = String(req.body?.ejkat || "2"); // "1" parcel, "2" lejlighed, "3" fritid
+    const tid    = String(req.body?.tid || "latest");
 
     if (postnr.length !== 4) return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
+    if (!["1","2","3"].includes(ejkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
 
-    const cacheKey = `${postnr}|${ejkat}|${pris}|${tid}`;
-    const cached = cacheGet(cacheKey);
-    if (cached && !debug) return res.json({ ok: true, ...cached, cached: true });
+    const key = `${postnr}|${ejkat}|${tid}`;
+    const cached = cacheGet(key);
 
-    // Cookie jar pr request (ASP session cookies) [3](https://w3schoolofcoding.com/php-parse-syntax-errors-and-how-to-solve-them/)[4](https://www.statistikbanken.dk/statbank5a/selectvarval/define.asp?MainTable=EJ67)
-    const jar = new CookieJar();
-    const fetchCookie = makeFetchCookie(fetch, jar);
-
-    // 1) Dansk sprog
-    await fetchCookie(PT_DA_URL, { headers: baseHeaders() });
-    await sleep(1200);
-
-    // 2) Define => latest kvartal
-    const defineResp = await fetchCookie(DEFINE_URL, { headers: baseHeaders() });
-    const defineHtml = decodeEntities(await readHtml(defineResp));
-
-    if (!tid || tid === "latest" || tid === "seneste") {
-      const latest = findLatestQuarterCode(defineHtml);
-      if (!latest) return res.status(502).json({ ok: false, error: "Kunne ikke finde seneste kvartal" });
-      tid = latest;
+    // hvis vi har frisk cache → returner straks
+    if (cached && cached._fresh) {
+      const { _ageMs, _fresh, ...rest } = cached;
+      return res.json({ ok: true, ...rest, cached: true });
     }
 
-    // 3) Save selections
-    const body = buildSelectionBody({ postnr, ejkat, pris, tid });
+    // ellers prøv at hente live
+    const live = await fetchM2FromStatbank(postnr, ejkat, tid);
+    cacheSet(key, live);
+    return res.json({ ok: true, ...live, cached: false });
 
-    await sleep(1200);
-    const saveResp = await fetchCookie(SAVE_URL, {
-      method: "POST",
-      headers: { ...baseHeaders(DEFINE_URL), "Content-Type": "application/x-www-form-urlencoded" },
-      body
-    });
+  } catch (err) {
+    // Hvis StatBank fejler → returnér stale cache hvis vi har den
+    const postnr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
+    const ejkat  = String(req.body?.ejkat || "2");
+    const tid    = String(req.body?.tid || "latest");
+    const key = `${postnr}|${ejkat}|${tid}`;
+    const cached = cacheGet(key);
 
-    let saveHtml = decodeEntities(await readHtml(saveResp));
-    saveHtml = await unwrapFrames(fetchCookie, saveHtml, SAVE_URL);
-
-    // 4) ShowTable (med retry mod DBDown)
-    const showHtml = await withDbDownRetry(async () => {
-      await sleep(1200);
-      const showResp = await fetchCookie(SHOWTABLE_URL, { headers: baseHeaders(SAVE_URL) });
-      let h = decodeEntities(await readHtml(showResp));
-      h = await unwrapFrames(fetchCookie, h, SHOWTABLE_URL);
-      return h;
-    });
-
-    if (!showHtml) {
-      return res.status(503).json({
-        ok: false,
-        error: "rkr svarer med DBDown (midlertidigt utilgængelig/blokeret). Prøv igen senere."
-      });
-    }
-
-    const m2 = extractIndholdFromHtml(showHtml);
-
-    if (debug) {
-      return res.json({
+    if (cached) {
+      const { _ageMs, _fresh, ...rest } = cached;
+      return res.status(200).json({
         ok: true,
-        tid_used: tid,
-        parsed_m2: m2,
-        htmlSnippet: showHtml.slice(0, 2500)
+        ...rest,
+        cached: true,
+        stale: true,
+        warning: "Live-kald fejlede, viser cache."
       });
     }
 
-    if (!m2) {
-      return res.status(502).json({
-        ok: false,
-        error: "Fandt ingen m²-pris (INDHOLD) i ShowTable HTML",
-        debug: { tid_used: tid, htmlSnippet: showHtml.slice(0, 2500) }
-      });
-    }
-
-    const result = { m2_price: m2, kvartal: tid };
-    cacheSet(cacheKey, result);
-
-    return res.json({ ok: true, ...result });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(502).json({
+      ok: false,
+      error: "Kunne ikke hente BM011 fra api.statbank.dk",
+      details: err?.message || String(err)
+    });
   }
 });
 
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Listening on", PORT));
