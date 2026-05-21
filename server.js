@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 
 const DATA_FILE = path.join(process.cwd(), "data", "bm011_latest.csv");
 
-// Valgfrit: beskyt reload-endpoint
+// Valgfrit: beskyt reload-endpoint (sæt env var ADMIN_TOKEN på Render)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 // In-memory: intervaller pr (tid, ejkat) => sorteret array til binær søgning
@@ -25,10 +25,10 @@ let intervalsByKey = new Map();
 let latestTidGlobal = null;
 let meta = { rows: 0, loadedAt: null, file: DATA_FILE };
 
+// ---------- Utils ----------
 function parseNum(val) {
   const s = String(val ?? "").trim();
   if (!s || s === "..") return null;
-  // håndter 45.123 / 45,123 / 45123
   const n = Number(s.replace(/\./g, "").replace(",", "."));
   return Number.isFinite(n) ? n : null;
 }
@@ -41,7 +41,7 @@ function readTextSmart(filePath) {
   return utf8;
 }
 
-// CSV-standard: hvis en hel linje er quoted og indeholder "" -> "  (escaped quotes)
+// Hvis hele linjen er i quotes og indeholder "" -> " (CSV-standard escape) [1](https://wplist.net/wordpress-forms-plugins/calculated-fields-form)
 function unquoteWholeLine(line) {
   let s = String(line).trim();
   if (s.startsWith('"') && s.endsWith('"')) {
@@ -51,23 +51,25 @@ function unquoteWholeLine(line) {
   return s;
 }
 
-// Konverter tid til tal så "latest" er robust (2025K4 > 2025K3)
 function tidToNum(tid) {
   const m = String(tid).match(/^(\d{4})[KQ]([1-4])$/i);
   if (!m) return -1;
   return Number(m[1]) * 10 + Number(m[2]);
 }
 
-// Parse én datalinje fra din eksport.
-// Understøtter både tab-separeret og space-separeret med quoted felter.
+function resolveTid(tid) {
+  if (!tid || tid === "latest" || tid === "seneste") return latestTidGlobal;
+  return tid;
+}
+
+// Parse én data-linje (understøtter dine nuværende linjer)
 function parseBm011Line(line) {
   let s = unquoteWholeLine(line).trim();
   if (!s) return null;
 
-  // 1) TAB-separeret variant
+  // TAB variant (hvis du en dag får den)
   if (s.includes("\t")) {
-    const cols = s.split("\t").map(x => x.trim()).filter(x => x.length > 0);
-    // forvent: Realiseret handelspris | "2025K4" | "1500-1799 Kbh.V." | .. | 78290 | 0
+    const cols = s.split("\t").map(x => x.trim()).filter(Boolean);
     if (cols.length < 6) return null;
     const first = cols[0].toLowerCase();
     if (!first.includes("realiseret")) return null;
@@ -84,7 +86,7 @@ function parseBm011Line(line) {
     };
   }
 
-  // 2) Space-separeret variant (som du viste):
+  // Space + quoted felter:
   // Realiseret handelspris "2025K4" "1500-1799 Kbh.V." .. 78290 0
   const m = s.match(/^Realiseret handelspris\s+"([^"]+)"\s+"([^"]+)"\s+(\S+)\s+(\S+)\s+(\S+)\s*$/i);
   if (!m) return null;
@@ -104,39 +106,79 @@ function parseBm011Line(line) {
 function parseRange(område) {
   const s = String(område || "").trim();
   const r = s.match(/^(\d{4})-(\d{4})/);
-  if (r) return { from: Number(r[1]), to: Number(r[2]) };
+  if (r) return { from: Number(r[1]), to: Number(r[2]), label: `${r[1]}-${r[2]}` };
 
   const one = s.match(/^(\d{4})/);
   if (one) {
     const p = Number(one[1]);
-    return { from: p, to: p };
+    return { from: p, to: p, label: `${p}` };
   }
   return null;
 }
 
-// Binær søgning i sorteret interval-liste
-function findInIntervals(list, postnrNum) {
+// Binær søgning: find sidste interval med from <= postnr
+// Returnér enten exact match (inside interval) eller null
+function findExact(list, postnrNum) {
+  if (!list || list.length === 0) return null;
+  let lo = 0, hi = list.length - 1;
+  let best = -1;
+
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid].from <= postnrNum) { best = mid; lo = mid + 1; }
+    else { hi = mid - 1; }
+  }
+  if (best === -1) return null;
+
+  const it = list[best];
+  if (postnrNum >= it.from && postnrNum <= it.to) return it;
+  return null;
+}
+
+// “Smartere fallback”: hvis der ikke findes exact interval, returnér nærmeste interval
+// (tager nabointerval før/efter og vælger korteste afstand)
+function findNearest(list, postnrNum) {
   if (!list || list.length === 0) return null;
 
   let lo = 0, hi = list.length - 1;
   let best = -1;
 
-  // find sidste interval med from <= postnr
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (list[mid].from <= postnrNum) {
-      best = mid;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
+    if (list[mid].from <= postnrNum) { best = mid; lo = mid + 1; }
+    else { hi = mid - 1; }
   }
 
-  if (best === -1) return null;
-  const it = list[best];
-  return (postnrNum >= it.from && postnrNum <= it.to) ? it.val : null;
+  const cand = [];
+  if (best >= 0) cand.push(list[best]);
+  if (best + 1 < list.length) cand.push(list[best + 1]);
+
+  let chosen = null;
+  let bestDist = Infinity;
+
+  for (const it of cand) {
+    let dist = 0;
+    if (postnrNum < it.from) dist = it.from - postnrNum;
+    else if (postnrNum > it.to) dist = postnrNum - it.to;
+    else dist = 0;
+
+    if (dist < bestDist) {
+      bestDist = dist;
+      chosen = it;
+    }
+  }
+  return chosen;
 }
 
+// Fallback-rækkefølge per ejkat
+function fallbackOrder(requestedEjkat) {
+  if (requestedEjkat === "1") return ["1", "2", "3"];
+  if (requestedEjkat === "2") return ["2", "1", "3"];
+  if (requestedEjkat === "3") return ["3", "1", "2"];
+  return ["2", "1", "3"];
+}
+
+// ---------- Load data ----------
 function loadLocalCsv() {
   if (!fs.existsSync(DATA_FILE)) {
     throw new Error(`Mangler datafil: ${DATA_FILE}`);
@@ -156,15 +198,12 @@ function loadLocalCsv() {
     const range = parseRange(row.område);
     if (!range) continue;
 
-    const { from, to } = range;
+    const { from, to, label } = range;
     const tid = row.tid;
     if (!tid) continue;
 
-    // seneste tid
     if (!latestTid || tidToNum(tid) > tidToNum(latestTid)) latestTid = tid;
 
-    // ejkat mapping:
-    // 1 = parcel, 2 = ejerlejlighed, 3 = fritid
     const candidates = [
       { ejkat: "1", val: row.parcel },
       { ejkat: "2", val: row.ejer },
@@ -175,7 +214,7 @@ function loadLocalCsv() {
       if (!c.val || c.val <= 0) continue;
       const key = `${tid}|${c.ejkat}`;
       if (!temp.has(key)) temp.set(key, []);
-      temp.get(key).push({ from, to, val: c.val });
+      temp.get(key).push({ from, to, val: c.val, label });
       rows++;
     }
   }
@@ -189,7 +228,6 @@ function loadLocalCsv() {
     );
   }
 
-  // sortér intervaller pr key så binær søgning virker
   const finalMap = new Map();
   for (const [key, arr] of temp.entries()) {
     arr.sort((a, b) => a.from - b.from);
@@ -206,17 +244,11 @@ function loadLocalCsv() {
 // load on startup
 loadLocalCsv();
 
-function resolveTid(tid) {
-  if (!tid || tid === "latest" || tid === "seneste") return latestTidGlobal;
-  return tid;
-}
-
-// health
+// ---------- Routes ----------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "dkbv-node-local", ...meta, latestTid: latestTidGlobal });
 });
 
-// reload (valgfrit)
 app.post("/reload", (req, res) => {
   if (ADMIN_TOKEN) {
     const token = String(req.headers["x-admin-token"] || "");
@@ -230,39 +262,71 @@ app.post("/reload", (req, res) => {
   }
 });
 
-// main endpoint (hurtig lookup)
+// Main: smarter fallback
 app.post("/bm011", (req, res) => {
   try {
     const postnrStr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const ejkat = String(req.body?.ejkat || "2").trim(); // "1","2","3"
+    const requestedEjkat = String(req.body?.ejkat || "2").trim(); // "1","2","3"
     const tidIn = String(req.body?.tid || "latest").trim();
 
     if (postnrStr.length !== 4) return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
-    if (!["1", "2", "3"].includes(ejkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
+    if (!["1", "2", "3"].includes(requestedEjkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
 
     const tid = resolveTid(tidIn);
     if (!tid) return res.status(500).json({ ok: false, error: "Ingen Tid i datafilen (latestTid mangler)" });
 
-    const key = `${tid}|${ejkat}`;
-    const list = intervalsByKey.get(key);
     const postnrNum = Number(postnrStr);
+    const order = fallbackOrder(requestedEjkat);
 
-    const m2 = findInIntervals(list, postnrNum);
+    // 1) Prøv exact match i ønsket kategori, ellers de andre
+    let chosen = null;
+    let usedEjkat = null;
+    let matchType = "exact";
 
-    if (!Number.isFinite(m2)) {
+    for (const ejkat of order) {
+      const list = intervalsByKey.get(`${tid}|${ejkat}`);
+      const hit = findExact(list, postnrNum);
+      if (hit && Number.isFinite(hit.val)) {
+        chosen = hit;
+        usedEjkat = ejkat;
+        matchType = "exact";
+        break;
+      }
+    }
+
+    // 2) Hvis stadig ingen, prøv nearest interval (smart fallback)
+    if (!chosen) {
+      for (const ejkat of order) {
+        const list = intervalsByKey.get(`${tid}|${ejkat}`);
+        const near = findNearest(list, postnrNum);
+        if (near && Number.isFinite(near.val)) {
+          chosen = near;
+          usedEjkat = ejkat;
+          matchType = "nearest";
+          break;
+        }
+      }
+    }
+
+    if (!chosen) {
       return res.status(404).json({
         ok: false,
-        error: "Ingen m²-pris fundet i filen for postnr/ejkat/tid",
+        error: "Ingen m²-pris fundet for dette postnr i nogen kategori (hverken exact eller nearest).",
         kvartal: tid
       });
     }
 
     return res.json({
       ok: true,
-      m2_price: m2,
+      m2_price: chosen.val,
       kvartal: tid,
       pris_code: "REAL",
-      source: "local_interval",
+      requested_ejkat: requestedEjkat,
+      used_ejkat: usedEjkat,
+      fallback: usedEjkat !== requestedEjkat,
+      match_type: matchType,
+      matched_range: `${chosen.label}`,
+      source: "local_interval_smart",
       file_rows: meta.rows
     });
   } catch (e) {
