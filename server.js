@@ -5,7 +5,7 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-// CORS (WordPress kan kalde)
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -15,17 +15,15 @@ app.use((req, res, next) => {
 });
 
 const DATA_FILE = path.join(process.cwd(), "data", "bm011_latest.csv");
-
-// Valgfrit: beskyt reload-endpoint (sæt env var ADMIN_TOKEN på Render)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// In-memory: intervaller pr (tid, ejkat) => sorteret array til binær søgning
-// key = `${tid}|${ejkat}` -> [{from,to,val}]
+// key = `${tid}|${ejkat}` -> [{from,to,val,label}]
 let intervalsByKey = new Map();
+let tidsDesc = []; // nyeste -> ældste
 let latestTidGlobal = null;
 let meta = { rows: 0, loadedAt: null, file: DATA_FILE };
 
-// ---------- Utils ----------
+// --- helpers ---
 function parseNum(val) {
   const s = String(val ?? "").trim();
   if (!s || s === "..") return null;
@@ -41,7 +39,7 @@ function readTextSmart(filePath) {
   return utf8;
 }
 
-// Hvis hele linjen er i quotes og indeholder "" -> " (CSV-standard escape) [1](https://wplist.net/wordpress-forms-plugins/calculated-fields-form)
+// CSV-standard: hvis linjen er "...." og indeholder "" -> " [1](https://stackoverflow.com/questions/17808511/how-to-properly-escape-a-double-quote-in-csv)
 function unquoteWholeLine(line) {
   let s = String(line).trim();
   if (s.startsWith('"') && s.endsWith('"')) {
@@ -51,32 +49,40 @@ function unquoteWholeLine(line) {
   return s;
 }
 
+// fx 2025K4 -> 20254
 function tidToNum(tid) {
   const m = String(tid).match(/^(\d{4})[KQ]([1-4])$/i);
   if (!m) return -1;
   return Number(m[1]) * 10 + Number(m[2]);
 }
 
-function resolveTid(tid) {
-  if (!tid || tid === "latest" || tid === "seneste") return latestTidGlobal;
+function resolveTidParam(tid) {
+  if (!tid || tid === "latest" || tid === "seneste") return "latest";
   return tid;
 }
 
-// Parse én data-linje (understøtter dine nuværende linjer)
+function fallbackOrder(requestedEjkat) {
+  // kun brugt hvis vi slet ikke kan finde nok data i ønsket kategori
+  if (requestedEjkat === "1") return ["1", "2", "3"];
+  if (requestedEjkat === "2") return ["2", "1", "3"];
+  if (requestedEjkat === "3") return ["3", "1", "2"];
+  return ["2", "1", "3"];
+}
+
+// Parse linje fra din eksport:
+// Realiseret handelspris "2025K4" "1500-1799 Kbh.V." .. 78290 0
 function parseBm011Line(line) {
   let s = unquoteWholeLine(line).trim();
   if (!s) return null;
 
-  // TAB variant (hvis du en dag får den)
+  // TAB variant (hvis den dukker op)
   if (s.includes("\t")) {
     const cols = s.split("\t").map(x => x.trim()).filter(Boolean);
     if (cols.length < 6) return null;
-    const first = cols[0].toLowerCase();
-    if (!first.includes("realiseret")) return null;
+    if (!cols[0].toLowerCase().includes("realiseret")) return null;
 
     const tid = String(cols[1]).replace(/^"+|"+$/g, "").trim();
     const område = String(cols[2]).replace(/^"+|"+$/g, "").trim();
-
     return {
       tid,
       område,
@@ -86,8 +92,6 @@ function parseBm011Line(line) {
     };
   }
 
-  // Space + quoted felter:
-  // Realiseret handelspris "2025K4" "1500-1799 Kbh.V." .. 78290 0
   const m = s.match(/^Realiseret handelspris\s+"([^"]+)"\s+"([^"]+)"\s+(\S+)\s+(\S+)\s+(\S+)\s*$/i);
   if (!m) return null;
 
@@ -100,14 +104,12 @@ function parseBm011Line(line) {
   };
 }
 
-// Uddrag interval fra område-teksten:
-// "1500-1799 Kbh.V." => from=1500, to=1799
-// "2100 København Ø" => from=2100, to=2100
+// "1500-1799 Kbh.V." -> {from:1500,to:1799,label:"1500-1799"}
+// "2100 København Ø" -> {from:2100,to:2100,label:"2100"}
 function parseRange(område) {
   const s = String(område || "").trim();
   const r = s.match(/^(\d{4})-(\d{4})/);
   if (r) return { from: Number(r[1]), to: Number(r[2]), label: `${r[1]}-${r[2]}` };
-
   const one = s.match(/^(\d{4})/);
   if (one) {
     const p = Number(one[1]);
@@ -116,8 +118,7 @@ function parseRange(område) {
   return null;
 }
 
-// Binær søgning: find sidste interval med from <= postnr
-// Returnér enten exact match (inside interval) eller null
+// Binær søgning: find interval der indeholder postnr (exact)
 function findExact(list, postnrNum) {
   if (!list || list.length === 0) return null;
   let lo = 0, hi = list.length - 1;
@@ -129,17 +130,13 @@ function findExact(list, postnrNum) {
     else { hi = mid - 1; }
   }
   if (best === -1) return null;
-
   const it = list[best];
-  if (postnrNum >= it.from && postnrNum <= it.to) return it;
-  return null;
+  return (postnrNum >= it.from && postnrNum <= it.to) ? it : null;
 }
 
-// “Smartere fallback”: hvis der ikke findes exact interval, returnér nærmeste interval
-// (tager nabointerval før/efter og vælger korteste afstand)
+// nearest (bruges kun hvis vi mangler *alt* i kategorien)
 function findNearest(list, postnrNum) {
   if (!list || list.length === 0) return null;
-
   let lo = 0, hi = list.length - 1;
   let best = -1;
 
@@ -170,25 +167,34 @@ function findNearest(list, postnrNum) {
   return chosen;
 }
 
-// Fallback-rækkefølge per ejkat
-function fallbackOrder(requestedEjkat) {
-  if (requestedEjkat === "1") return ["1", "2", "3"];
-  if (requestedEjkat === "2") return ["2", "1", "3"];
-  if (requestedEjkat === "3") return ["3", "1", "2"];
-  return ["2", "1", "3"];
+// Find “window” på 4 kvartaler (nyeste->ældre)
+function getWindowTids(anchorTid) {
+  if (!tidsDesc.length) return [];
+  if (!anchorTid || anchorTid === "latest") return tidsDesc.slice(0, 4);
+
+  const idx = tidsDesc.indexOf(anchorTid);
+  if (idx === -1) {
+    // hvis brugeren sender en tid der ikke findes, fald tilbage til latest window
+    return tidsDesc.slice(0, 4);
+  }
+  return tidsDesc.slice(idx, idx + 4);
 }
 
-// ---------- Load data ----------
+function avg(nums) {
+  const valid = nums.filter(n => Number.isFinite(n));
+  if (!valid.length) return null;
+  return valid.reduce((a, b) => a + b, 0) / valid.length;
+}
+
+// --- load data ---
 function loadLocalCsv() {
-  if (!fs.existsSync(DATA_FILE)) {
-    throw new Error(`Mangler datafil: ${DATA_FILE}`);
-  }
+  if (!fs.existsSync(DATA_FILE)) throw new Error(`Mangler datafil: ${DATA_FILE}`);
 
   const raw = readTextSmart(DATA_FILE);
   const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
 
-  const temp = new Map(); // `${tid}|${ejkat}` -> array
-  let latestTid = null;
+  const temp = new Map();
+  const tidSet = new Set();
   let rows = 0;
 
   for (const line of lines) {
@@ -202,7 +208,7 @@ function loadLocalCsv() {
     const tid = row.tid;
     if (!tid) continue;
 
-    if (!latestTid || tidToNum(tid) > tidToNum(latestTid)) latestTid = tid;
+    tidSet.add(tid);
 
     const candidates = [
       { ejkat: "1", val: row.parcel },
@@ -221,11 +227,7 @@ function loadLocalCsv() {
 
   if (rows === 0) {
     const sample = lines.slice(0, 8).join("\n");
-    throw new Error(
-      "Kunne ikke parse nogen rækker fra datafilen.\n" +
-      "Første linjer:\n" + sample + "\n\n" +
-      'TIP: Linjer skal ligne fx: "Realiseret handelspris ""2025K4"" ""1500-1799 Kbh.V."" .. 78290 0"'
-    );
+    throw new Error("Kunne ikke parse nogen rækker fra datafilen.\nFørste linjer:\n" + sample);
   }
 
   const finalMap = new Map();
@@ -235,18 +237,24 @@ function loadLocalCsv() {
   }
 
   intervalsByKey = finalMap;
-  latestTidGlobal = latestTid;
-  meta = { rows, loadedAt: new Date().toISOString(), file: DATA_FILE };
+  tidsDesc = [...tidSet].sort((a, b) => tidToNum(b) - tidToNum(a));
+  latestTidGlobal = tidsDesc[0] || null;
 
-  console.log("Loaded local BM011:", { ...meta, latestTid: latestTidGlobal, keys: intervalsByKey.size });
+  meta = { rows, loadedAt: new Date().toISOString(), file: DATA_FILE };
+  console.log("Loaded BM011:", { ...meta, latestTid: latestTidGlobal, tidCount: tidsDesc.length });
 }
 
-// load on startup
 loadLocalCsv();
 
-// ---------- Routes ----------
+// --- routes ---
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "dkbv-node-local", ...meta, latestTid: latestTidGlobal });
+  res.json({
+    ok: true,
+    service: "dkbv-node-avg4q",
+    ...meta,
+    latestTid: latestTidGlobal,
+    tids: tidsDesc.slice(0, 6)
+  });
 });
 
 app.post("/reload", (req, res) => {
@@ -262,72 +270,166 @@ app.post("/reload", (req, res) => {
   }
 });
 
-// Main: smarter fallback
+// Main: 4 kvartalers gennemsnit før fallback
 app.post("/bm011", (req, res) => {
   try {
     const postnrStr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const requestedEjkat = String(req.body?.ejkat || "2").trim(); // "1","2","3"
-    const tidIn = String(req.body?.tid || "latest").trim();
+    const requestedEjkat = String(req.body?.ejkat || "2").trim();
+    const tidParam = resolveTidParam(String(req.body?.tid || "latest").trim());
+    const debug = req.body?.debug === true;
 
     if (postnrStr.length !== 4) return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
     if (!["1", "2", "3"].includes(requestedEjkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
 
-    const tid = resolveTid(tidIn);
-    if (!tid) return res.status(500).json({ ok: false, error: "Ingen Tid i datafilen (latestTid mangler)" });
-
     const postnrNum = Number(postnrStr);
-    const order = fallbackOrder(requestedEjkat);
+    const windowTids = getWindowTids(tidParam);
 
-    // 1) Prøv exact match i ønsket kategori, ellers de andre
-    let chosen = null;
-    let usedEjkat = null;
-    let matchType = "exact";
+    if (!windowTids.length) {
+      return res.status(500).json({ ok: false, error: "Ingen tidsdata i filen." });
+    }
 
-    for (const ejkat of order) {
-      const list = intervalsByKey.get(`${tid}|${ejkat}`);
+    // 1) Prøv requested kategori på alle 4 kvartaler (exact) og beregn gennemsnit
+    const exactVals = [];
+    const exactUsed = [];
+
+    for (const tid of windowTids) {
+      const list = intervalsByKey.get(`${tid}|${requestedEjkat}`);
       const hit = findExact(list, postnrNum);
       if (hit && Number.isFinite(hit.val)) {
-        chosen = hit;
-        usedEjkat = ejkat;
-        matchType = "exact";
-        break;
+        exactVals.push(hit.val);
+        exactUsed.push({ tid, range: hit.label, val: hit.val });
       }
     }
 
-    // 2) Hvis stadig ingen, prøv nearest interval (smart fallback)
-    if (!chosen) {
-      for (const ejkat of order) {
-        const list = intervalsByKey.get(`${tid}|${ejkat}`);
-        const near = findNearest(list, postnrNum);
-        if (near && Number.isFinite(near.val)) {
-          chosen = near;
-          usedEjkat = ejkat;
-          matchType = "nearest";
-          break;
-        }
-      }
-    }
-
-    if (!chosen) {
-      return res.status(404).json({
-        ok: false,
-        error: "Ingen m²-pris fundet for dette postnr i nogen kategori (hverken exact eller nearest).",
-        kvartal: tid
+    // hvis vi har mindst 2 observationer -> gennemsnit (stabilt)
+    if (exactVals.length >= 2) {
+      const mean = avg(exactVals);
+      return res.json({
+        ok: true,
+        m2_price: Math.round(mean),
+        method: "avg_4q_exact",
+        sample_count: exactVals.length,
+        tids_window: windowTids,
+        requested_ejkat: requestedEjkat,
+        used_ejkat: requestedEjkat,
+        category_fallback: false,
+        match_type: "exact",
+        source: "local_avg4q",
+        ...(debug ? { samples: exactUsed } : {})
       });
     }
 
-    return res.json({
-      ok: true,
-      m2_price: chosen.val,
-      kvartal: tid,
-      pris_code: "REAL",
-      requested_ejkat: requestedEjkat,
-      used_ejkat: usedEjkat,
-      fallback: usedEjkat !== requestedEjkat,
-      match_type: matchType,
-      matched_range: `${chosen.label}`,
-      source: "local_interval_smart",
-      file_rows: meta.rows
+    // hvis vi kun har 1 observation -> brug den (men markér at det er svagere)
+    if (exactVals.length === 1) {
+      return res.json({
+        ok: true,
+        m2_price: exactVals[0],
+        method: "single_exact_in_window",
+        sample_count: 1,
+        tids_window: windowTids,
+        requested_ejkat: requestedEjkat,
+        used_ejkat: requestedEjkat,
+        category_fallback: false,
+        match_type: "exact",
+        source: "local_avg4q",
+        ...(debug ? { samples: exactUsed } : {})
+      });
+    }
+
+    // 2) Hvis der intet findes i requested kategori: prøv NEAREST inden vi skifter kategori
+    const nearVals = [];
+    const nearUsed = [];
+    for (const tid of windowTids) {
+      const list = intervalsByKey.get(`${tid}|${requestedEjkat}`);
+      const near = findNearest(list, postnrNum);
+      if (near && Number.isFinite(near.val)) {
+        nearVals.push(near.val);
+        nearUsed.push({ tid, range: near.label, val: near.val });
+      }
+    }
+    if (nearVals.length >= 2) {
+      const mean = avg(nearVals);
+      return res.json({
+        ok: true,
+        m2_price: Math.round(mean),
+        method: "avg_4q_nearest",
+        sample_count: nearVals.length,
+        tids_window: windowTids,
+        requested_ejkat: requestedEjkat,
+        used_ejkat: requestedEjkat,
+        category_fallback: false,
+        match_type: "nearest",
+        source: "local_avg4q",
+        ...(debug ? { samples: nearUsed } : {})
+      });
+    }
+    if (nearVals.length === 1) {
+      return res.json({
+        ok: true,
+        m2_price: nearVals[0],
+        method: "single_nearest_in_window",
+        sample_count: 1,
+        tids_window: windowTids,
+        requested_ejkat: requestedEjkat,
+        used_ejkat: requestedEjkat,
+        category_fallback: false,
+        match_type: "nearest",
+        source: "local_avg4q",
+        ...(debug ? { samples: nearUsed } : {})
+      });
+    }
+
+    // 3) Først NU: kategori-fallback (prøv andre ejkat med samme 4 kvartaler)
+    const cats = fallbackOrder(requestedEjkat).filter(c => c !== requestedEjkat);
+
+    for (const cat of cats) {
+      const vals = [];
+      const used = [];
+      for (const tid of windowTids) {
+        const list = intervalsByKey.get(`${tid}|${cat}`);
+        const hit = findExact(list, postnrNum);
+        if (hit && Number.isFinite(hit.val)) {
+          vals.push(hit.val);
+          used.push({ tid, range: hit.label, val: hit.val });
+        }
+      }
+      if (vals.length >= 2) {
+        const mean = avg(vals);
+        return res.json({
+          ok: true,
+          m2_price: Math.round(mean),
+          method: "avg_4q_category_fallback_exact",
+          sample_count: vals.length,
+          tids_window: windowTids,
+          requested_ejkat: requestedEjkat,
+          used_ejkat: cat,
+          category_fallback: true,
+          match_type: "exact",
+          source: "local_avg4q",
+          ...(debug ? { samples: used } : {})
+        });
+      }
+      if (vals.length === 1) {
+        return res.json({
+          ok: true,
+          m2_price: vals[0],
+          method: "single_category_fallback_exact",
+          sample_count: 1,
+          tids_window: windowTids,
+          requested_ejkat: requestedEjkat,
+          used_ejkat: cat,
+          category_fallback: true,
+          match_type: "exact",
+          source: "local_avg4q",
+          ...(debug ? { samples: used } : {})
+        });
+      }
+    }
+
+    return res.status(404).json({
+      ok: false,
+      error: "Ingen m²-pris fundet i de seneste 4 kvartaler (heller ikke med kategori-fallback).",
+      tids_window: windowTids
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
