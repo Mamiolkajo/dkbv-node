@@ -1,9 +1,11 @@
+import fs from "fs";
+import path from "path";
 import express from "express";
 
 const app = express();
 app.use(express.json());
 
-// CORS så WordPress/browser kan kalde API’et
+// CORS (WordPress kan kalde)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -12,178 +14,190 @@ app.use((req, res, next) => {
   next();
 });
 
-// ====== StatBank API (officiel) ======
-const SB_API = "https://api.statbank.dk/v1"; // endpoints: /tableinfo, /data [1](https://wpforms.com/docs/calculations-formula-examples/)
-const TABLE = "BM011";
-const LANG = "da";
+const DATA_FILE = path.join(process.cwd(), "data", "bm011_latest.csv");
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// ====== Cache (production) ======
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 timer
-const CACHE = new Map(); // key -> {t, data}
-function cacheGet(key) {
-  const v = CACHE.get(key);
-  if (!v) return null;
-  const age = Date.now() - v.t;
-  return { ...v.data, _ageMs: age, _fresh: age <= CACHE_TTL_MS };
-}
-function cacheSet(key, data) {
-  CACHE.set(key, { t: Date.now(), data });
+// In-memory index: `${postnr}|${ejkat}|REAL|${tid}` -> value
+let index = new Map();
+let latestTidGlobal = null;
+let meta = { rows: 0, loadedAt: null, file: DATA_FILE };
+
+function parseNum(val) {
+  const s = String(val ?? "").trim();
+  if (!s || s === "..") return null;
+  const n = Number(s.replace(/\./g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
 }
 
-// ====== Simpel rate limit (per IP) ======
-const RL = new Map(); // ip -> {t, n}
-const RL_WINDOW_MS = 10_000; // 10 sek
-const RL_MAX = 5; // max 5 requests pr 10 sek pr ip
-function rateLimit(req, res) {
-  const ip = req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.socket.remoteAddress || "unknown";
-  const now = Date.now();
-  const cur = RL.get(ip) || { t: now, n: 0 };
-  if (now - cur.t > RL_WINDOW_MS) { cur.t = now; cur.n = 0; }
-  cur.n += 1;
-  RL.set(ip, cur);
-  if (cur.n > RL_MAX) {
-    res.status(429).json({ ok: false, error: "Rate limit: prøv igen om lidt." });
-    return false;
+// Læs som tekst (prøv utf8, fallback latin1 hvis mange  )
+function readTextSmart(filePath) {
+  const buf = fs.readFileSync(filePath);
+  const utf8 = buf.toString("utf8");
+  const bad = (utf8.match(/ /g) || []).length;
+  if (bad >= 2) return buf.toString("latin1");
+  return utf8;
+}
+
+// Fjern yderste quotes og af-escape "" -> "  (CSV-standard) [1](https://stackoverflow.com/questions/17808511/how-to-properly-escape-a-double-quote-in-csv)
+function unquoteWholeLine(line) {
+  let s = String(line).trim();
+  if (s.startsWith('"') && s.endsWith('"')) {
+    s = s.slice(1, -1);
+    s = s.replace(/""/g, '"');
   }
-  return true;
+  return s;
 }
 
-function jsonPost(url, body) {
-  return fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  }).then(async (res) => {
-    const txt = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${txt.slice(0, 200)}`);
-    return txt;
-  });
-}
+// Parser én datalinje i din eksport
+function parseBm011Line(line) {
+  let s = unquoteWholeLine(line).trim();
+  if (!s) return null;
 
-async function getTableInfo() {
-  const body = { lang: LANG, table: TABLE, format: "JSON" };
-  const txt = await jsonPost(`${SB_API}/tableinfo`, body); // [1](https://wpforms.com/docs/calculations-formula-examples/)
-  return JSON.parse(txt);
-}
+  // Hvis den er tab-separeret (nogle eksport gør det), håndter det:
+  if (s.includes("\t")) {
+    const cols = s.split("\t").map(x => x.trim()).filter(Boolean);
+    // forvent: Realiseret handelspris | "2025K4" | "2100 København Ø" | .. | 76703 | 0
+    if (cols.length < 6) return null;
 
-function findLatestTid(tableInfo) {
-  const vars = tableInfo.variables || [];
-  const tidVar = vars.find(v => v.id === "Tid");
-  if (!tidVar || !tidVar.values) return null;
-  const ids = tidVar.values.map(x => x.id).filter(Boolean).sort();
-  return ids.length ? ids[ids.length - 1] : null;
-}
+    const tid = cols[1].replace(/^"+|"+$/g, "");
+    const område = cols[2].replace(/^"+|"+$/g, "");
+    const postMatch = område.match(/^(\d{4})/);
+    if (!postMatch) return null;
 
-function findPris20Realiseret(tableInfo) {
-  const vars = tableInfo.variables || [];
-  const prisVar = vars.find(v => v.id === "PRIS20");
-  if (!prisVar || !prisVar.values) return null;
-
-  // vælg den value der indeholder “realiseret/realized”
-  for (const val of prisVar.values) {
-    const t = (val.text || "").toLowerCase();
-    if (t.includes("realiseret") || t.includes("realized")) return val.id;
+    return {
+      tid,
+      postnr: postMatch[1],
+      parcel: parseNum(cols[3]),
+      ejer: parseNum(cols[4]),
+      fritid: parseNum(cols[5])
+    };
   }
-  // fallback: første hvis teksten ændrer sig
-  return prisVar.values[0]?.id || null;
-}
 
-function parseBulkSemicolon(txt) {
-  const lines = txt.trim().split(/\r?\n/);
-  if (lines.length < 2) return null;
-  const header = lines[0].split(";");
-  const idxV = header.indexOf("INDHOLD");
-  if (idxV === -1) return null;
+  // Ellers: din nuværende fil er space-separated med quoted felter:
+  // Realiseret handelspris "2025K4" "1000-1499 Kbh.K." .. 79322 0
+  // Vi matcher den struktur direkte
+  const m = s.match(/^Realiseret handelspris\s+"([^"]+)"\s+"([^"]+)"\s+(\S+)\s+(\S+)\s+(\S+)\s*$/i);
+  if (!m) return null;
 
-  // 1 række forventes når vi sender 1 postnr + 1 ejkat + 1 pris + 1 tid
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(";");
-    const val = Number(String(cols[idxV] || "").replace(",", "."));
-    if (Number.isFinite(val) && val > 0) return val;
-  }
-  return null;
-}
+  const tid = m[1].trim();
+  const område = m[2].trim();
+  const postMatch = område.match(/^(\d{4})/);
+  if (!postMatch) return null;
 
-async function fetchM2FromStatbank(postnr, ejkat, tid = "latest") {
-  const ti = await getTableInfo();
-  const latestTid = (tid === "latest" || tid === "seneste") ? findLatestTid(ti) : tid;
-  const pris20 = findPris20Realiseret(ti);
-
-  if (!latestTid) throw new Error("Kunne ikke finde seneste Tid i tableinfo.");
-  if (!pris20) throw new Error("Kunne ikke finde PRIS20 (realiseret) i tableinfo.");
-
-  const req = {
-    table: TABLE,
-    lang: LANG,
-    format: "BULK",
-    variables: [
-      { code: "PNR20", values: [postnr] },
-      { code: "EJKAT20", values: [ejkat] },
-      { code: "PRIS20", values: [pris20] },
-      { code: "Tid", values: [latestTid] }
-    ]
+  return {
+    tid,
+    postnr: postMatch[1],
+    parcel: parseNum(m[3]),
+    ejer: parseNum(m[4]),
+    fritid: parseNum(m[5])
   };
-
-  const bulk = await jsonPost(`${SB_API}/data`, req); // [1](https://wpforms.com/docs/calculations-formula-examples/)
-  const m2 = parseBulkSemicolon(bulk);
-
-  if (!m2) throw new Error("Kunne ikke parse INDHOLD fra BULK.");
-  return { m2_price: m2, kvartal: latestTid, source: "api.statbank.dk" };
 }
 
-// Health
-app.get("/", (req, res) => res.json({ ok: true, service: "dkbv-node", source: "api.statbank.dk" }));
+function loadLocalCsv() {
+  if (!fs.existsSync(DATA_FILE)) {
+    throw new Error(`Mangler datafil: ${DATA_FILE}`);
+  }
 
-// Main endpoint
-app.post("/bm011", async (req, res) => {
-  if (!rateLimit(req, res)) return;
+  const raw = readTextSmart(DATA_FILE);
+  const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
 
+  const newIndex = new Map();
+  let latestTid = null;
+
+  for (const line of lines) {
+    const row = parseBm011Line(line);
+    if (!row) continue;
+
+    const { tid, postnr, parcel, ejer, fritid } = row;
+    const pris = "REAL";
+
+    // ejkat: 1=parcel, 2=ejerlejlighed, 3=fritid
+    if (parcel && parcel > 0) newIndex.set(`${postnr}|1|${pris}|${tid}`, parcel);
+    if (ejer && ejer > 0)     newIndex.set(`${postnr}|2|${pris}|${tid}`, ejer);
+    if (fritid && fritid > 0) newIndex.set(`${postnr}|3|${pris}|${tid}`, fritid);
+
+    if (!latestTid || tid > latestTid) latestTid = tid;
+  }
+
+  if (newIndex.size === 0) {
+    const sample = lines.slice(0, 8).join("\n");
+    throw new Error(
+      "Kunne ikke parse nogen rækker fra datafilen.\n" +
+      "Første linjer:\n" + sample + "\n\n" +
+      "TIP: Filen skal indeholde rækker der ligner:\n" +
+      'Realiseret handelspris "2025K4" "2100 København Ø" .. 76703 0'
+    );
+  }
+
+  index = newIndex;
+  latestTidGlobal = latestTid;
+  meta = { rows: newIndex.size, loadedAt: new Date().toISOString(), file: DATA_FILE };
+
+  console.log("Loaded local BM011:", { ...meta, latestTid: latestTidGlobal });
+}
+
+// load on startup
+loadLocalCsv();
+
+function resolveTid(tid) {
+  if (!tid || tid === "latest" || tid === "seneste") return latestTidGlobal;
+  return tid;
+}
+
+// health
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "dkbv-node-local", ...meta, latestTid: latestTidGlobal });
+});
+
+// reload (valgfrit)
+app.post("/reload", (req, res) => {
+  if (ADMIN_TOKEN) {
+    const token = String(req.headers["x-admin-token"] || "");
+    if (token !== ADMIN_TOKEN) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    loadLocalCsv();
+    res.json({ ok: true, message: "Reloaded", ...meta, latestTid: latestTidGlobal });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// main endpoint
+app.post("/bm011", (req, res) => {
   try {
     const postnr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const ejkat  = String(req.body?.ejkat || "2"); // "1" parcel, "2" lejlighed, "3" fritid
-    const tid    = String(req.body?.tid || "latest");
+    const ejkat  = String(req.body?.ejkat || "2").trim();
+    const tidIn  = String(req.body?.tid || "latest").trim();
 
     if (postnr.length !== 4) return res.status(400).json({ ok: false, error: "postnr skal være 4 cifre" });
-    if (!["1","2","3"].includes(ejkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
+    if (!["1", "2", "3"].includes(ejkat)) return res.status(400).json({ ok: false, error: "ejkat skal være 1, 2 eller 3" });
 
-    const key = `${postnr}|${ejkat}|${tid}`;
-    const cached = cacheGet(key);
+    const tid = resolveTid(tidIn);
+    if (!tid) return res.status(500).json({ ok: false, error: "Ingen Tid i datafilen (latestTid mangler)" });
 
-    // hvis vi har frisk cache → returner straks
-    if (cached && cached._fresh) {
-      const { _ageMs, _fresh, ...rest } = cached;
-      return res.json({ ok: true, ...rest, cached: true });
-    }
+    const pris = "REAL";
+    const key = `${postnr}|${ejkat}|${pris}|${tid}`;
+    const m2 = index.get(key);
 
-    // ellers prøv at hente live
-    const live = await fetchM2FromStatbank(postnr, ejkat, tid);
-    cacheSet(key, live);
-    return res.json({ ok: true, ...live, cached: false });
-
-  } catch (err) {
-    // Hvis StatBank fejler → returnér stale cache hvis vi har den
-    const postnr = String(req.body?.postnr || "").replace(/\D/g, "").slice(0, 4);
-    const ejkat  = String(req.body?.ejkat || "2");
-    const tid    = String(req.body?.tid || "latest");
-    const key = `${postnr}|${ejkat}|${tid}`;
-    const cached = cacheGet(key);
-
-    if (cached) {
-      const { _ageMs, _fresh, ...rest } = cached;
-      return res.status(200).json({
-        ok: true,
-        ...rest,
-        cached: true,
-        stale: true,
-        warning: "Live-kald fejlede, viser cache."
+    if (!Number.isFinite(m2)) {
+      return res.status(404).json({
+        ok: false,
+        error: "Ingen m²-pris fundet i filen for postnr/ejkat/tid",
+        kvartal: tid
       });
     }
 
-    return res.status(502).json({
-      ok: false,
-      error: "Kunne ikke hente BM011 fra api.statbank.dk",
-      details: err?.message || String(err)
+    return res.json({
+      ok: true,
+      m2_price: m2,
+      kvartal: tid,
+      pris_code: pris,
+      source: "local_file",
+      file_rows: meta.rows
     });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
